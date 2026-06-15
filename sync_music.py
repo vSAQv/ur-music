@@ -70,6 +70,9 @@ from config import (
     QUEUE_TIMEOUT_HOURS,
     MAX_RETRIES,
     LLM_SHORT_TITLE_WORDS,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MODEL,
+    FALLBACK_MODELS,
 )
 
 # ─── ЛОГИРОВАНИЕ ─────────────────────────────────────────────────────────────
@@ -372,23 +375,48 @@ def is_valid_match(file_path, raw_artist, raw_title, expected_dur, actual_dur):
     return artist_found
 
 
-# ─── LLM (LiteLLM → Gemini 2.5 Flash) ───────────────────────────────────────
+# ─── LLM (OpenRouter Direct) ────────────────────────────────────────────────
 def _llm_chat(prompt, max_tokens=20):
-    """Универсальный вызов LiteLLM. Возвращает текст ответа или None."""
-    try:
-        resp = requests.post(
-            f"{LITELLM_URL}/v1/chat/completions",
-            json={
-                "model": "gemini/gemini-2.5-flash",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=20,
-        )
-        if resp.ok:
-            return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.warning(f"[LLM] Недоступен: {e}")
+    """Универсальный вызов OpenRouter. Перебирает FALLBACK_MODELS по очереди."""
+    if not OPENROUTER_API_KEY:
+        log.warning("[LLM] OpenRouter API key не задан. Запрос пропущен.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/cif/homeMusic",
+        "X-Title": "homeMusic Sync",
+    }
+
+    # Уникальный список моделей для пробы
+    models_to_try = []
+    for m in FALLBACK_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    for model in models_to_try:
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=15,
+            )
+            if resp.ok:
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                if content:
+                    return content
+            else:
+                log.warning(f"[LLM] Модель {model} вернула ошибку: HTTP {resp.status_code} — {resp.text[:150]}")
+        except Exception as e:
+            log.warning(f"[LLM] Ошибка при запросе к {model}: {e}")
+
+    log.error("[LLM] Все модели OpenRouter вернули ошибку.")
     return None
 
 

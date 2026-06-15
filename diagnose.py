@@ -19,8 +19,10 @@ from config import (
     SLSKD_URL,
     SLSKD_USERNAME,
     SLSKD_PASSWORD,
-    LITELLM_URL,
     HISTORY_FILE,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MODEL,
+    FALLBACK_MODELS,
 )
 
 SEP = "─" * 60
@@ -158,96 +160,74 @@ def check_slskd():
 
 
 # ─── 2. LITELLM ───────────────────────────────────────────────────────────────
-def check_litellm():
+# ─── 2. OPENROUTER ────────────────────────────────────────────────────────────
+def check_openrouter():
     print(f"\n{SEP}")
-    print("2. LiteLLM")
+    print("2. OpenRouter")
     print(SEP)
 
-    # 2a. Доступность
-    try:
-        resp = requests.get(f"{LITELLM_URL}/health", timeout=5)
-        ok(f"LiteLLM доступен: {LITELLM_URL}  (HTTP {resp.status_code})")
-    except requests.ConnectionError:
-        err(f"Не удалось подключиться к {LITELLM_URL}")
-        err("Проверь: docker ps | grep litellm")
+    if not OPENROUTER_API_KEY:
+        err("OPENROUTER_API_KEY не задан в .env!")
         return
-    except Exception as e:
-        warn(f"Health endpoint вернул ошибку: {e}")
 
-    # 2b. Список моделей
+    # 2a. Тестовый запрос к основной модели
+    print(f"Тестовый запрос к OpenRouter (модель: {OPENROUTER_MODEL})...")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
     try:
-        resp = requests.get(f"{LITELLM_URL}/v1/models", timeout=10)
-        if resp.ok:
-            models = [m["id"] for m in resp.json().get("data", [])]
-            ok(f"Зарегистрированные модели: {models}")
-
-            # Проверяем, есть ли нужная модель
-            target = "gemini/gemini-2.5-flash"
-            if target in models:
-                ok(f"Модель {target!r} найдена")
-            else:
-                err(f"Модель {target!r} НЕ найдена в списке!")
-                warn("В sync_music.py используется 'gemini/gemini-2.5-flash'")
-                warn(f"Доступные имена: {models}")
-                warn("→ Либо поменяй model_name в config.yaml LiteLLM,")
-                warn("  либо поменяй 'model' в _llm_chat() в sync_music.py")
-        else:
-            warn(f"Не удалось получить список моделей: {resp.status_code}")
-    except Exception as e:
-        warn(f"Ошибка получения моделей: {e}")
-
-    # 2c. Тестовый запрос
-    print()
-    info("Тестовый LLM запрос (модель: gemini/gemini-2.5-flash)...")
-    try:
-        t0   = time.time()
+        t0 = time.time()
         resp = requests.post(
-            f"{LITELLM_URL}/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
             json={
-                "model":      "gemini/gemini-2.5-flash",
+                "model": OPENROUTER_MODEL,
                 "max_tokens": 10,
-                "messages":   [{"role": "user", "content": "Reply with the single word: WORKING"}]
+                "messages": [{"role": "user", "content": "Reply with the single word: WORKING"}]
             },
-            timeout=30
+            timeout=20
         )
         elapsed = time.time() - t0
-
+        
         if resp.ok:
             answer = resp.json()["choices"][0]["message"]["content"].strip()
-            ok(f"LLM ответил за {elapsed:.1f}с: {answer!r}")
+            ok(f"Успешный ответ от {OPENROUTER_MODEL} за {elapsed:.1f}с: {answer!r}")
         else:
-            err(f"LLM вернул ошибку: HTTP {resp.status_code}")
-            body = resp.json()
-            err(f"Сообщение: {body.get('error', {}).get('message', resp.text[:300])}")
-
-            # Специфичная диагностика частых ошибок
-            text = resp.text.lower()
-            if "api_key" in text or "401" in str(resp.status_code) or "invalid" in text:
-                print()
-                warn("═══ ОШИБКА API КЛЮЧА ════════════════════════")
-                warn("Твой config.yaml содержит:")
-                warn('  api_key: "os.environ/AIzaSyYourGeminiApiKeyHere"')
-                warn("")
-                warn("Это НЕВЕРНЫЙ синтаксис! LiteLLM интерпретирует это как:")
-                warn('  os.getenv("AIzaSyYourGeminiApiKeyHere") → None')
-                warn("")
-                warn("Исправление (вариант A — ключ напрямую):")
-                warn('  api_key: "AIzaSyYourGeminiApiKeyHere"')
-                warn("")
-                warn("Исправление (вариант B — через env var, рекомендуется):")
-                warn("  В docker-compose.yaml добавь:")
-                warn("    environment:")
-                warn("      - GEMINI_API_KEY=AIzaSyYourGeminiApiKeyHere")
-                warn("  В config.yaml:")
-                warn('    api_key: "os.environ/GEMINI_API_KEY"')
-                warn("═════════════════════════════════════════════")
-            elif "model" in text or "not found" in text:
-                warn("Возможно неверное имя модели. Проверь model_name в config.yaml")
+            err(f"Ошибка HTTP {resp.status_code} для модели {OPENROUTER_MODEL}: {resp.text[:300]}")
+            
+            # 2b. Пробуем фоллбэки, если основная модель упала
+            print()
+            warn("Основная модель недоступна. Проверяем работоспособность фоллбэк-моделей...")
+            for model in FALLBACK_MODELS:
+                if model == OPENROUTER_MODEL:
+                    continue
+                info(f"Пробуем фоллбэк: {model}...")
+                try:
+                    t_fall = time.time()
+                    resp_fall = requests.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model,
+                            "max_tokens": 10,
+                            "messages": [{"role": "user", "content": "Reply with the single word: WORKING"}]
+                        },
+                        timeout=15
+                    )
+                    if resp_fall.ok:
+                        ans_fall = resp_fall.json()["choices"][0]["message"]["content"].strip()
+                        ok(f"  Фоллбэк {model} работает! Ответил за {time.time() - t_fall:.1f}с: {ans_fall!r}")
+                        break
+                    else:
+                        warn(f"  Фоллбэк {model} вернул ошибку: HTTP {resp_fall.status_code}")
+                except Exception as e:
+                    warn(f"  Фоллбэк {model} не сработал: {e}")
     except requests.Timeout:
-        err("LLM не ответил за 30 секунд (таймаут)")
-        warn("Проверь: работает ли контейнер litellm? docker logs litellm")
+        err("Запрос к OpenRouter отвалился по таймауту (20 секунд)")
     except Exception as e:
-        err(f"LLM запрос упал с исключением: {e}")
+        err(f"Запрос к OpenRouter упал с исключением: {e}")
 
 
 # ─── 3. ИСТОРИЯ И SLSKD RECONCILE ─────────────────────────────────────────────
@@ -352,9 +332,8 @@ def print_summary():
     print("4. ЧТО ДЕЛАТЬ ДАЛЬШЕ")
     print(SEP)
     print("""
-  A. Если LiteLLM показал ошибку API ключа:
-     → Исправь config.yaml (см. fixed_litellm_config.yaml)
-     → docker restart litellm
+  A. Если OpenRouter показал ошибку API ключа:
+     → Проверь OPENROUTER_API_KEY в .env
      → Запусти diagnose.py снова
 
   B. Если slskd недоступен:
@@ -382,7 +361,7 @@ def main():
     print("=" * 60)
 
     slskd_token = check_slskd()
-    check_litellm()
+    check_openrouter()
     check_history_vs_slskd(slskd_token)
     print_summary()
 

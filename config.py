@@ -43,6 +43,28 @@ SLSKD_PASSWORD = os.getenv("SLSKD_PASSWORD")
 METUBE_URL = os.getenv("METUBE_URL", "http://localhost:8081")
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 
+# OpenRouter Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+
+fallback_models_raw = os.getenv("FALLBACK_MODELS")
+if fallback_models_raw:
+    FALLBACK_MODELS = [m.strip() for m in fallback_models_raw.split(",") if m.strip()]
+else:
+    FALLBACK_MODELS = [
+        "openrouter/owl-alpha",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "google/gemma-4-31b-it:free",
+        "openai/gpt-oss-120b:free",
+        "poolside/laguna-m.1:free",
+        "z-ai/glm-4.5-air:free",
+        "openrouter/free",
+    ]
+
+if OPENROUTER_MODEL and OPENROUTER_MODEL not in FALLBACK_MODELS:
+    FALLBACK_MODELS = [OPENROUTER_MODEL] + FALLBACK_MODELS
+
 # Spotify Credentials
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
