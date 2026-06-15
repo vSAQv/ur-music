@@ -1,0 +1,6 @@
+.env
+__pycache__/
+.mypy_cache
+sync_history.json
+sync_history.json.bak
+*.log
