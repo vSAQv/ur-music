@@ -1,6 +1,20 @@
 .env
 __pycache__/
 .mypy_cache
+*.log
+# Runtime state — never commit these
 sync_history.json
 sync_history.json.bak
-*.log
+discovery_state.json
+download_queue.json
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml

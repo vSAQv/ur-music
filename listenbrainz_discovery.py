@@ -25,6 +25,8 @@ import os
 import re
 import time
 import logging
+import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 # ─── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
@@ -34,7 +36,8 @@ from config import (
     NAVIDROME_PASS,
     LISTENBRAINZ_TOKEN,
     LISTENBRAINZ_USER,
-    SUBMIT_LISTENS_COUNT,
+    LISTEN_HISTORY_COUNT,
+    DISCOVERY_SEED_ARTISTS,
     WEEKLY_COUNT,
     MONTHLY_COUNT,
     WEEKLY_NAME,
@@ -123,40 +126,6 @@ class NavidromeClient:
             return None
 
     # ── Чтение ────────────────────────────────────────────────────────────────
-    def get_recent_plays(self, count=500):
-        """Возвращает недавно воспроизведённые треки."""
-        result = []
-        offset = 0
-        while len(result) < count:
-            data = self._get(
-                "getAlbumList2",
-                type="recent",
-                size=min(500, count - len(result)),
-                offset=offset,
-            )
-            if not data:
-                break
-            albums = data.get("albumList2", {}).get("album", [])
-            if not albums:
-                break
-            for album in albums:
-                songs_data = self._get("getAlbumSongs", id=album["id"])
-                if songs_data:
-                    for song in songs_data.get("songs", {}).get("song", []):
-                        result.append(
-                            {
-                                "id": song.get("id"),
-                                "artist": song.get("artist", ""),
-                                "title": song.get("title", ""),
-                                "album": song.get("album", ""),
-                                "played_at": int(time.time()),
-                            }
-                        )
-            offset += len(albums)
-            if len(albums) < 500:
-                break
-        return result[:count]
-
     def get_starred_ids(self):
         """ID треков, которые пользователь пометил звёздочкой."""
         data = self._get("getStarred2")
@@ -190,7 +159,7 @@ class NavidromeClient:
         return all_ids
 
     def search_track(self, artist, title):
-        """Ищет трек в библиотеке Navidrome. Возвращает ID первого совпадения."""
+        """Ищет только точное совпадение трека в библиотеке Navidrome."""
         query = f"{artist} {title}"
         data = self._get(
             "search3", query=query, songCount=5, albumCount=0, artistCount=0
@@ -200,16 +169,15 @@ class NavidromeClient:
         songs = data.get("searchResult3", {}).get("song", [])
         if not songs:
             return None
-        # Ищем наиболее точное совпадение
-        q_title = title.lower()
-        q_artist = artist.lower()
+        def normalize(value):
+            return set(re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE))
+
+        q_title = normalize(title)
+        q_artist = normalize(artist)
         for song in songs:
-            if (
-                q_title in song.get("title", "").lower()
-                and q_artist in song.get("artist", "").lower()
-            ):
+            if normalize(song.get("title", "")) == q_title and normalize(song.get("artist", "")) == q_artist:
                 return song["id"]
-        return songs[0]["id"] if songs else None
+        return None
 
     # ── Плейлисты ─────────────────────────────────────────────────────────────
     def get_or_create_playlist(self, name):
@@ -226,7 +194,7 @@ class NavidromeClient:
         """Удаляет все треки из плейлиста."""
         songs = self.get_playlist_songs(playlist_id)
         if not songs:
-            return
+            return True
         # Subsonic: songIndexToRemove (можно несколько параметров с одинаковым именем)
         indices = list(range(len(songs)))
         # Батчами по 50
@@ -238,11 +206,18 @@ class NavidromeClient:
                 if isinstance(params["songIndexToRemove"], list):
                     params["songIndexToRemove"].append(idx)
             try:
-                requests.post(
+                response = requests.post(
                     f"{self.url}/rest/updatePlaylist", params=params, timeout=15
                 )
+                response.raise_for_status()
+                data = response.json().get("subsonic-response", {})
+                if data.get("status") != "ok":
+                    log.warning(f"Ошибка очистки плейлиста: {data.get('error', {})}")
+                    return False
             except Exception as e:
                 log.warning(f"Ошибка очистки плейлиста: {e}")
+                return False
+        return True
 
     def add_songs_to_playlist(self, playlist_id, song_ids):
         """Добавляет треки в плейлист батчами."""
@@ -254,11 +229,18 @@ class NavidromeClient:
                 if isinstance(params["songIdToAdd"], list):
                     params["songIdToAdd"].append(sid)
             try:
-                requests.post(
+                response = requests.post(
                     f"{self.url}/rest/updatePlaylist", params=params, timeout=15
                 )
+                response.raise_for_status()
+                data = response.json().get("subsonic-response", {})
+                if data.get("status") != "ok":
+                    log.warning(f"Ошибка добавления в плейлист: {data.get('error', {})}")
+                    return False
             except Exception as e:
                 log.warning(f"Ошибка добавления в плейлист: {e}")
+                return False
+        return True
 
     def start_scan(self):
         """Запускает пересканирование библиотеки Navidrome."""
@@ -266,113 +248,147 @@ class NavidromeClient:
 
 
 # ─── LISTENBRAINZ ─────────────────────────────────────────────────────────────
-def submit_listens_to_lb(navidrome: NavidromeClient):
-    """
-    Отправляет историю прослушиваний Navidrome в ListenBrainz.
-    Нужно для того, чтобы LB накопил данные и мог строить персональные рекомендации.
-    """
-    log.info("[LB] Синхронизация истории прослушиваний с ListenBrainz...")
-    recent = navidrome.get_recent_plays(SUBMIT_LISTENS_COUNT)
-    if not recent:
-        log.info("[LB] Нет треков для синхронизации")
-        return
-
-    payload = []
-    for track in recent:
-        payload.append(
-            {
-                "listened_at": track["played_at"],
-                "track_metadata": {
-                    "artist_name": track["artist"],
-                    "track_name": track["title"],
-                    "release_name": track["album"],
-                    "additional_info": {
-                        "media_player": "navidrome",
-                        "submission_client": "navidrome_discovery",
-                    },
-                },
-            }
-        )
-
-    # LB принимает батчами по 1000
-    for i in range(0, len(payload), 1000):
-        batch = payload[i : i + 1000]
-        try:
-            resp = requests.post(
-                f"{LB_API}/1/submit-listens",
-                headers={**_lb_headers(), "Content-Type": "application/json"},
-                json={"listen_type": "import", "payload": batch},
-                timeout=30,
-            )
-            if resp.ok:
-                log.info(f"[LB] Отправлено {len(batch)} прослушиваний")
-            else:
-                log.warning(
-                    f"[LB] Ошибка отправки: {resp.status_code} {resp.text[:200]}"
-                )
-        except Exception as e:
-            log.error(f"[LB] Ошибка: {e}")
-
-
-def fetch_lb_recommendation_playlists():
-    """
-    Получает авторские плейлисты-рекомендации от ListenBrainz:
-    - Exploration playlist (weekly)
-    - Top Discoveries (monthly)
-
-    Возвращает {"weekly": [...tracks], "monthly": [...tracks]}
-    где каждый трек: {"artist": str, "title": str}
-    """
-    log.info("[LB] Загружаем рекомендательные плейлисты...")
-    result = {"weekly": [], "monthly": []}
-
+def _fetch_listens_since(days):
+    """Fetch real ListenBrainz listens from the requested time window."""
+    min_ts = int(time.time()) - days * 24 * 60 * 60
     try:
-        resp = requests.get(
+        response = requests.get(
+            f"{LB_API}/1/user/{LISTENBRAINZ_USER}/listens",
+            headers=_lb_headers(),
+            params={"min_ts": min_ts, "count": LISTEN_HISTORY_COUNT},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json().get("payload", {})
+        listens = payload.get("listens", [])
+        return listens if isinstance(listens, list) else []
+    except (requests.RequestException, TypeError, ValueError) as error:
+        log.warning(f"[LB] Не удалось получить историю за {days} дней: {error}")
+        return []
+
+
+def _listen_seed(listen):
+    """Extract an artist seed and recording identity from one ListenBrainz listen."""
+    metadata = listen.get("track_metadata", {}) if isinstance(listen, dict) else {}
+    additional = metadata.get("additional_info", {}) or {}
+    mapping = metadata.get("mbid_mapping", {}) or {}
+    artist_mbids = mapping.get("artist_mbids") or additional.get("artist_mbids") or []
+    recording_mbid = mapping.get("recording_mbid") or additional.get("recording_mbid")
+    artist_mbid = artist_mbids[0] if artist_mbids else None
+    return {
+        "artist": metadata.get("artist_name", ""),
+        "title": metadata.get("track_name", ""),
+        "artist_mbid": artist_mbid,
+        "recording_mbid": recording_mbid,
+    }
+
+
+def _fetch_radio_recordings(artist_mbid):
+    """Get ListenBrainz radio recordings for one artist seed."""
+    try:
+        response = requests.get(
+            f"{LB_API}/1/lb-radio/artist/{urllib.parse.quote(artist_mbid, safe='')}",
+            headers=_lb_headers(),
+            params={
+                "mode": "medium",
+                "max_similar_artists": 10,
+                "max_recordings_per_artist": 10,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, TypeError, ValueError) as error:
+        log.warning(f"[LB] Radio error for artist {artist_mbid}: {error}")
+        return []
+
+    recordings = []
+    values = payload.values() if isinstance(payload, dict) else []
+    for group in values:
+        if not isinstance(group, list):
+            continue
+        recordings.extend(item for item in group if isinstance(item, dict))
+    return recordings
+
+
+def _fetch_period_recommendations(days, count):
+    """Build recommendations from artists listened to during a time window."""
+    listens = _fetch_listens_since(days)
+    artist_counts = Counter()
+    listened_recordings = set()
+    for listen in listens:
+        seed = _listen_seed(listen)
+        if seed["artist_mbid"]:
+            artist_counts[seed["artist_mbid"]] += 1
+        if seed["recording_mbid"]:
+            listened_recordings.add(seed["recording_mbid"])
+
+    recommendations = []
+    seen_recordings = set()
+    for artist_mbid, _ in artist_counts.most_common(DISCOVERY_SEED_ARTISTS):
+        for recording in _fetch_radio_recordings(artist_mbid):
+            recording_mbid = recording.get("recording_mbid")
+            if not recording_mbid or recording_mbid in listened_recordings or recording_mbid in seen_recordings:
+                continue
+            info = _lookup_mbid(recording_mbid)
+            time.sleep(1)
+            if info:
+                recommendations.append(info)
+                seen_recordings.add(recording_mbid)
+            if len(recommendations) >= count:
+                return recommendations
+    return recommendations
+
+
+def _fetch_curated_recommendation_playlists():
+    """Read ListenBrainz's published recommendation playlists as a fallback."""
+    result = {"weekly": [], "monthly": []}
+    try:
+        response = requests.get(
             f"{LB_API}/1/user/{LISTENBRAINZ_USER}/playlists/recommendations",
             headers=_lb_headers(),
             timeout=30,
         )
-        if not resp.ok:
-            log.warning(f"[LB] Ошибка загрузки плейлистов: {resp.status_code}")
-            return result
-
-        playlists = resp.json().get("playlists", [])
-        log.info(f"[LB] Найдено плейлистов: {len(playlists)}")
-
-        for pl_wrapper in playlists:
-            pl = pl_wrapper.get("playlist", {})
-            title = pl.get("title", "").lower()
+        response.raise_for_status()
+        playlists = response.json().get("playlists", [])
+        for wrapper in playlists:
+            playlist = wrapper.get("playlist", {})
+            title = playlist.get("title", "").lower()
             tracks = []
-
-            for track in pl.get("track", []):
+            for track in playlist.get("track", []):
                 artist = track.get("creator", "")
                 name = track.get("title", "")
-                # Иногда creator пустой — ищем в extension
                 if not artist:
-                    ext = track.get("extension", {})
-                    for v in ext.values():
-                        if isinstance(v, dict) and v.get("artist_credit_name"):
-                            artist = v["artist_credit_name"]
+                    for value in (track.get("extension", {}) or {}).values():
+                        if isinstance(value, dict) and value.get("artist_credit_name"):
+                            artist = value["artist_credit_name"]
                             break
                 if artist and name:
                     tracks.append({"artist": artist, "title": name})
-
             if "exploration" in title or "weekly" in title:
                 result["weekly"] = tracks
-                log.info(f"[LB] Weekly: {len(tracks)} треков")
             elif "discoveries" in title or "monthly" in title or "top" in title:
                 result["monthly"] = tracks
-                log.info(f"[LB] Monthly: {len(tracks)} треков")
+    except (requests.RequestException, TypeError, ValueError) as error:
+        log.warning(f"[LB] Ошибка загрузки авторских плейлистов: {error}")
+    return result
 
-    except Exception as e:
-        log.error(f"[LB] Ошибка: {e}")
 
-    # Фоллбэк: CF-рекомендации если авторских плейлистов нет
-    if not result["weekly"] and not result["monthly"]:
-        log.info("[LB] Авторских плейлистов нет — загружаем CF рекомендации...")
+def fetch_lb_recommendation_playlists():
+    """Return separate recommendation sets based on seven and thirty days of history."""
+    result = {
+        "weekly": _fetch_period_recommendations(7, WEEKLY_COUNT * 2),
+        "monthly": _fetch_period_recommendations(30, MONTHLY_COUNT * 2),
+    }
+    curated = _fetch_curated_recommendation_playlists()
+    if not result["weekly"]:
+        result["weekly"] = curated["weekly"]
+    if not result["monthly"]:
+        result["monthly"] = curated["monthly"]
+    if not result["weekly"]:
         result["weekly"] = _fetch_cf_recommendations(WEEKLY_COUNT * 2)
+    if not result["monthly"]:
         result["monthly"] = _fetch_cf_recommendations(MONTHLY_COUNT * 2)
-
     return result
 
 
@@ -398,7 +414,7 @@ def _fetch_cf_recommendations(count=50):
                 info = _lookup_mbid(mbid)
                 if info:
                     tracks.append(info)
-                time.sleep(0.1)  # уважаем MB rate limit
+                time.sleep(1)  # MusicBrainz requests are rate-limited.
     except Exception as e:
         log.warning(f"[LB CF] Ошибка: {e}")
     return tracks
@@ -443,9 +459,19 @@ def queue_for_download(tracks_to_download):
     if os.path.exists(SYNC_QUEUE_FILE):
         try:
             with open(SYNC_QUEUE_FILE, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            pass
+                raw = json.load(f)
+                if isinstance(raw, list):
+                    existing = [
+                        item
+                        for item in raw
+                        if isinstance(item, dict) and item.get("artist") and item.get("title")
+                    ]
+                else:
+                    log.error("[Queue] Existing queue is not a JSON list; preserving it")
+                    return
+        except (OSError, ValueError, TypeError) as error:
+            log.error("[Queue] Cannot read existing queue: %s", error)
+            return
 
     existing_keys = {f"{t['artist'].lower()} - {t['title'].lower()}" for t in existing}
 
@@ -457,8 +483,19 @@ def queue_for_download(tracks_to_download):
             existing_keys.add(key)
             added += 1
 
-    with open(SYNC_QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(existing, f, ensure_ascii=False, indent=2)
+    temporary = f"{SYNC_QUEUE_FILE}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, SYNC_QUEUE_FILE)
+    except OSError as error:
+        log.error("[Queue] Cannot persist queue: %s", error)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
     log.info(f"[Queue] Добавлено {added} треков для скачивания")
 
@@ -515,7 +552,7 @@ def update_discovery_playlist(
     playlist_id = navidrome.get_or_create_playlist(playlist_name)
     if not playlist_id:
         log.error(f"Не удалось создать плейлист: {playlist_name}")
-        return
+        return False
 
     log.info(f"\n[Playlist] Обновление: {playlist_name}")
 
@@ -538,7 +575,7 @@ def update_discovery_playlist(
         if len(found_ids) >= count:
             break
         song_id = navidrome.search_track(track["artist"], track["title"])
-        if song_id:
+        if song_id and song_id not in found_ids:
             found_ids.append(song_id)
             log.info(f"  [✓] В библиотеке: {track['artist']} — {track['title']}")
         else:
@@ -548,17 +585,30 @@ def update_discovery_playlist(
     # Добавляем отсутствующие треки в очередь скачивания
     queue_for_download(to_download)
 
-    if not found_ids:
+    protected_current_ids = [
+        song.get("id")
+        for song in current_songs
+        if song.get("id") in protected_ids and song.get("id") not in found_ids
+    ]
+    playlist_ids = protected_current_ids + found_ids
+
+    if not playlist_ids:
         log.info(f"  Нет треков для добавления в плейлист (ещё скачиваются)")
-        return
+        return False
 
     # Очищаем плейлист
-    navidrome.clear_playlist(playlist_id)
+    if not navidrome.clear_playlist(playlist_id):
+        log.error(f"  Не удалось безопасно очистить {playlist_name}")
+        return False
     log.info(f"  Плейлист очищен")
 
     # Заполняем новыми треками
-    navidrome.add_songs_to_playlist(playlist_id, found_ids)
-    log.info(f"  [✓] Добавлено {len(found_ids)} треков в {playlist_name}")
+    if navidrome.add_songs_to_playlist(playlist_id, playlist_ids):
+        log.info(f"  [✓] Добавлено {len(playlist_ids)} треков в {playlist_name}")
+    else:
+        log.error(f"  Не удалось заполнить {playlist_name}")
+        return False
+    return True
 
 
 def main():
@@ -576,8 +626,9 @@ def main():
     navidrome = NavidromeClient(NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASS)
     state = load_state()
 
-    # Синхронизируем историю прослушиваний с LB (для обучения модели)
-    submit_listens_to_lb(navidrome)
+    # ListenBrainz history must be submitted by a real scrobbling client. The
+    # Navidrome Subsonic API does not expose playback timestamps here.
+    log.info("[LB] Skipping synthetic Navidrome listen import")
 
     need_weekly = should_rotate_weekly(state)
     need_monthly = should_rotate_monthly(state)
@@ -591,8 +642,7 @@ def main():
 
     if need_weekly:
         tracks = recommendations.get("weekly", [])
-        if tracks:
-            update_discovery_playlist(navidrome, WEEKLY_NAME, tracks, WEEKLY_COUNT)
+        if tracks and update_discovery_playlist(navidrome, WEEKLY_NAME, tracks, WEEKLY_COUNT):
             state["last_weekly"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
         else:
@@ -602,8 +652,7 @@ def main():
 
     if need_monthly:
         tracks = recommendations.get("monthly", [])
-        if tracks:
-            update_discovery_playlist(navidrome, MONTHLY_NAME, tracks, MONTHLY_COUNT)
+        if tracks and update_discovery_playlist(navidrome, MONTHLY_NAME, tracks, MONTHLY_COUNT):
             state["last_monthly"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
         else:

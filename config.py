@@ -69,34 +69,33 @@ if OPENROUTER_MODEL and OPENROUTER_MODEL not in FALLBACK_MODELS:
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-# PLAYLIST_URLS (parsed from comma-separated string)
+# PLAYLIST_URLS (parsed from comma-separated string in .env)
+# Set PLAYLIST_URLS in your .env file — no default is provided to avoid
+# committing personal playlist links to the public repository.
 urls_raw = os.getenv("PLAYLIST_URLS")
 if urls_raw:
     PLAYLIST_URLS = [u.strip() for u in urls_raw.split(",") if u.strip()]
 else:
-    PLAYLIST_URLS = [
-        "https://www.youtube.com/playlist?list=PLFS0A3AYl_QzBCoMuLQAaioq9FhaKeCFN",
-        "https://music.yandex.com/users/gaylord24/playlists/1013?ref_id=900C6D28-04B5-4BC5-A667-D947FEDFD0A8&utm_medium=copy_link",
-        "https://open.spotify.com/playlist/4I2U62HaUvxTlljOXj2d7g?si=RDm-INhvTRKur5uqT85Ppw",
-    ]
+    PLAYLIST_URLS = []
 
-# Paths
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/home/cif/homelab/data/music")
+# Paths — defaults are relative to the project directory so no user-specific
+# absolute paths are hardcoded in the public repository.
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", str(base_dir / "music"))
 MUSIC_ROOT = os.getenv("MUSIC_ROOT", DOWNLOAD_DIR)
 MUSIC_ROOT_HOST = os.getenv("MUSIC_ROOT_HOST", DOWNLOAD_DIR)
 MUSIC_ROOT_CONTAINER = os.getenv("MUSIC_ROOT_CONTAINER", "/music")
-TRASH_DIR = os.getenv("TRASH_DIR", "/home/cif/homelab/data/music/.trash")
+TRASH_DIR = os.getenv("TRASH_DIR", str(base_dir / "music" / ".trash"))
 TRASH_DAYS = get_int("TRASH_DAYS", 7)
 
-# Configurations / State Paths
-HISTORY_FILE = os.getenv("HISTORY_FILE", "/home/cif/homelab/config/sync_music/sync_history.json")
-STATE_FILE = os.getenv("STATE_FILE", "/home/cif/homelab/config/sync_music/discovery_state.json")
-SYNC_QUEUE_FILE = os.getenv("SYNC_QUEUE_FILE", "/home/cif/homelab/config/sync_music/download_queue.json")
+# State / queue file paths (default to project directory)
+HISTORY_FILE = os.getenv("HISTORY_FILE", str(base_dir / "sync_history.json"))
+STATE_FILE = os.getenv("STATE_FILE", str(base_dir / "discovery_state.json"))
+SYNC_QUEUE_FILE = os.getenv("SYNC_QUEUE_FILE", str(base_dir / "download_queue.json"))
 
-# Log Paths
-SYNC_LOG_FILE = os.getenv("SYNC_LOG_FILE", "/home/cif/homelab/config/sync_music/sync_music.log")
-DISCOVERY_LOG_FILE = os.getenv("DISCOVERY_LOG_FILE", "/home/cif/homelab/config/sync_music/discovery.log")
-DELETE_DAEMON_LOG_FILE = os.getenv("DELETE_DAEMON_LOG_FILE", "/home/cif/homelab/config/sync_music/delete_daemon.log")
+# Log file paths (default to project directory)
+SYNC_LOG_FILE = os.getenv("SYNC_LOG_FILE", str(base_dir / "sync_music.log"))
+DISCOVERY_LOG_FILE = os.getenv("DISCOVERY_LOG_FILE", str(base_dir / "discovery.log"))
+DELETE_DAEMON_LOG_FILE = os.getenv("DELETE_DAEMON_LOG_FILE", str(base_dir / "delete_daemon.log"))
 
 # Tuning Parameters
 TOLERANCE_SEC = get_int("TOLERANCE_SEC", 12)
@@ -105,9 +104,10 @@ QUEUE_TIMEOUT_HOURS = get_int("QUEUE_TIMEOUT_HOURS", 4)
 MAX_RETRIES = get_int("MAX_RETRIES", 3)
 LLM_SHORT_TITLE_WORDS = get_int("LLM_SHORT_TITLE_WORDS", 3)
 
-SUBMIT_LISTENS_COUNT = get_int("SUBMIT_LISTENS_COUNT", 200)
 WEEKLY_COUNT = get_int("WEEKLY_COUNT", 20)
 MONTHLY_COUNT = get_int("MONTHLY_COUNT", 40)
+LISTEN_HISTORY_COUNT = get_int("LISTEN_HISTORY_COUNT", 1000)
+DISCOVERY_SEED_ARTISTS = get_int("DISCOVERY_SEED_ARTISTS", 5)
 WEEKLY_NAME = os.getenv("WEEKLY_NAME", "🔮 Discover Weekly")
 MONTHLY_NAME = os.getenv("MONTHLY_NAME", "🌙 Discover Monthly")
 

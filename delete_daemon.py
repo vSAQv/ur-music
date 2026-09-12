@@ -136,17 +136,16 @@ class NavidromeClient:
     def remove_from_playlist(self, playlist_id, song_indices):
         """Удаляет треки из плейлиста по индексам (начиная с конца, чтобы не сбить индексы)."""
         for idx in sorted(song_indices, reverse=True):
-            params = self._params(playlistId=playlist_id, songIndexToRemove=idx)
-            try:
-                requests.post(
-                    f"{self.url}/rest/updatePlaylist", data=params, timeout=15
-                )
-            except Exception as e:
-                log.warning(f"Ошибка удаления из плейлиста: {e}")
+            if not self._post("updatePlaylist", playlistId=playlist_id, songIndexToRemove=idx):
+                log.warning(f"Ошибка удаления индекса {idx} из плейлиста")
+                return False
+        return True
 
     def start_scan(self):
-        self._get("startScan")
+        if self._get("startScan") is None:
+            return False
         log.info("[Scan] Запущено ресканирование библиотеки Navidrome")
+        return True
 
     def wait_for_scan(self, timeout=120):
         """Ждёт завершения сканирования."""
@@ -166,14 +165,31 @@ def container_path_to_host(container_path):
     Конвертирует путь из ответа Navidrome (внутри контейнера) в путь на хосте.
     /music/Artist/Album/track.flac → /home/cif/homelab/data/music/Artist/Album/track.flac
     """
-    if container_path.startswith(MUSIC_ROOT_CONTAINER):
-        relative = container_path[len(MUSIC_ROOT_CONTAINER) :].lstrip("/")
-        return os.path.join(MUSIC_ROOT_HOST, relative)
-    # Если путь уже абсолютный хостовый — вернуть как есть
-    if container_path.startswith(MUSIC_ROOT_HOST):
-        return container_path
-    # Попытка как относительный путь
-    return os.path.join(MUSIC_ROOT_HOST, container_path.lstrip("/"))
+    if not container_path:
+        return None
+
+    root = Path(MUSIC_ROOT_HOST).absolute()
+    candidate = Path(str(container_path))
+    container_root = Path(MUSIC_ROOT_CONTAINER).absolute()
+
+    if candidate.is_absolute():
+        if str(candidate) == str(container_root) or str(candidate).startswith(f"{container_root}{os.sep}"):
+            candidate = root / str(candidate.relative_to(container_root))
+        elif str(candidate) == str(root) or str(candidate).startswith(f"{root}{os.sep}"):
+            candidate = candidate
+        else:
+            return None
+    else:
+        candidate = root / candidate
+
+    candidate = candidate.resolve(strict=False)
+    root = root.resolve(strict=False)
+    try:
+        if os.path.commonpath((str(root), str(candidate))) != str(root):
+            return None
+    except ValueError:
+        return None
+    return str(candidate)
 
 
 def move_to_trash(file_path):
@@ -181,6 +197,10 @@ def move_to_trash(file_path):
     Перемещает файл в TRASH_DIR с временной меткой.
     Возвращает True при успехе.
     """
+    if not file_path or container_path_to_host(file_path) != str(Path(file_path).resolve(strict=False)):
+        log.error(f"Отказано: путь вне MUSIC_ROOT_HOST: {file_path}")
+        return False
+
     if not os.path.exists(file_path):
         log.warning(f"Файл уже не существует: {file_path}")
         return True
@@ -197,7 +217,7 @@ def move_to_trash(file_path):
         # Удалить пустые родительские папки (альбом/артист)
         parent = os.path.dirname(file_path)
         for _ in range(3):  # max 3 уровня вверх
-            if parent == MUSIC_ROOT_HOST:
+            if os.path.abspath(parent) == os.path.abspath(MUSIC_ROOT_HOST):
                 break
             try:
                 if not os.listdir(parent):
@@ -265,16 +285,17 @@ def process_delete_queue(navidrome: NavidromeClient):
         song_info = navidrome.get_song(song_id)
         if not song_info:
             log.warning(f"  Не удалось получить метаданные: {song_title}")
-            indices_to_remove.append(idx)
             continue
 
         container_path = song_info.get("path", "")
         if not container_path:
             log.warning(f"  Путь не найден в метаданных: {song_title}")
-            indices_to_remove.append(idx)
             continue
 
         host_path = container_path_to_host(container_path)
+        if not host_path:
+            log.error(f"  Отказано: путь вне музыкального корня: {container_path}")
+            continue
         log.info(f"  Удаляем: {song_title}")
         log.info(f"    Путь: {host_path}")
 
@@ -286,12 +307,15 @@ def process_delete_queue(navidrome: NavidromeClient):
             log.error(f"  [✗] Не удалось удалить: {song_title}")
 
     # Убираем обработанные треки из плейлиста
-    if indices_to_remove:
-        navidrome.remove_from_playlist(playlist_id, indices_to_remove)
+    if indices_to_remove and not navidrome.remove_from_playlist(playlist_id, indices_to_remove):
+        log.error("[Delete] Не удалось обновить Delete Queue; оставляем его для следующего запуска")
+        return
 
     if deleted_count > 0:
         # Запускаем ресканирование чтобы треки исчезли из Navidrome
-        navidrome.start_scan()
+        if not navidrome.start_scan():
+            log.error("[Delete] Не удалось запустить сканирование после удаления")
+            return
         navidrome.wait_for_scan()
         log.info(
             f"[Delete] Итог: удалено={deleted_count}, пропущено(starred)={skipped_count}"

@@ -1,0 +1,4 @@
+emoji>=2.14,<3
+mutagen>=1.47,<2
+python-dotenv>=1.0,<2
+requests>=2.32,<3
