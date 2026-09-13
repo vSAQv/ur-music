@@ -33,6 +33,26 @@ class MatchingTests(unittest.TestCase):
         path = r"Music\Linkin Park\01 - Forgotten.flac"
         self.assertFalse(sync_music.is_valid_match(path, "Linkin Park", "Forgotten", 180, 220))
 
+    def test_explicit_remix_tag_is_rejected(self):
+        self.assertFalse(
+            sync_music._tagged_identity_matches(
+                "Chikoi The Maid",
+                "I'm Cool",
+                "Kichi",
+                "Chikoi The Maid - I'm Cool [Kichi Remix]",
+            )
+        )
+
+    def test_accented_explicit_tag_matches_unaccented_request(self):
+        self.assertTrue(
+            sync_music._tagged_identity_matches(
+                "Eminem",
+                "Deja Vu",
+                "Eminem",
+                "Déjà vu",
+            )
+        )
+
     def test_quality_is_primary_and_lyrics_are_secondary(self):
         responses = [
             {

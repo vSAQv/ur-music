@@ -15,6 +15,7 @@ import re
 import subprocess
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -77,6 +78,7 @@ MODIFIERS = {
 TITLE_STOPWORDS = {"a", "an", "and", "of", "on", "the", "to"}
 RETRY_DELAY_SECONDS = int(os.getenv("RETRY_DELAY_SECONDS", "900"))
 METUBE_TIMEOUT_HOURS = int(os.getenv("METUBE_TIMEOUT_HOURS", "12"))
+LOCAL_SETTLE_SECONDS = int(os.getenv("LOCAL_SETTLE_SECONDS", "30"))
 
 os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
 logging.basicConfig(
@@ -226,7 +228,9 @@ def _deduplicate_tracks(tracks):
 
 
 def get_words(text):
-    return set(re.findall(r"[\w]+", str(text).casefold(), flags=re.UNICODE))
+    folded = unicodedata.normalize("NFKD", str(text).casefold())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return set(re.findall(r"[\w]+", folded, flags=re.UNICODE))
 
 
 def remove_emojis(text):
@@ -325,6 +329,19 @@ def _audio_duration(audio):
         return 0.0
 
 
+def _tagged_identity_matches(artist, title, tagged_artist, tagged_title):
+    """Reject explicit metadata that identifies another artist or version."""
+    expected_artist = get_words(super_clean_title(artist))
+    actual_artist = get_words(super_clean_title(tagged_artist))
+    expected_title = _title_words(title)
+    actual_title = _title_words(tagged_title)
+    if not expected_artist or not expected_artist.issubset(actual_artist):
+        return False
+    if not expected_title or not expected_title.issubset(actual_title):
+        return False
+    return not (_modifier_words(tagged_title) - _modifier_words(title))
+
+
 def is_valid_match(file_path, raw_artist, raw_title, expected_dur=0, actual_dur=0):
     """Validate identity using filename title, path-component artist, and duration."""
     filename_words = _filename_words(file_path)
@@ -363,21 +380,17 @@ def is_track_in_library(artist, title, duration=0):
             except Exception:
                 pass
             actual_duration = _audio_duration(audio)
-            if is_valid_match(path, artist, title, duration, actual_duration):
-                return True
             tagged_artist = _audio_artist(audio)
             tagged_title = _audio_title(audio)
-            if tagged_artist and tagged_title:
-                expected_title_words = _title_words(title)
-                actual_title_words = _title_words(tagged_title)
-                title_matches = expected_title_words.issubset(actual_title_words)
-                if len(expected_title_words) <= 2:
-                    title_matches = expected_title_words == actual_title_words
-                if title_matches and expected_title_words and _title_words(artist).issubset(
-                    get_words(super_clean_title(tagged_artist))
+            if tagged_artist or tagged_title:
+                if tagged_artist and tagged_title and _tagged_identity_matches(
+                    artist, title, tagged_artist, tagged_title
                 ):
                     if not duration or not actual_duration or abs(float(duration) - actual_duration) <= TOLERANCE_SEC:
                         return True
+                continue
+            if is_valid_match(path, artist, title, duration, actual_duration):
+                return True
     return False
 
 
@@ -839,6 +852,13 @@ def monitor_and_retry(token, history):
         state = transfer.get("state", "")
         info["transfer_id"] = transfer.get("id") or info.get("transfer_id")
         if _transfer_succeeded(state):
+            completed_at = _parse_time(info.get("completed_at"))
+            if completed_at is None:
+                info["completed_at"] = now.isoformat()
+                save_history(history)
+                continue
+            if now - completed_at < timedelta(seconds=LOCAL_SETTLE_SECONDS):
+                continue
             if is_track_in_library(artist, title, info.get("duration", 0)):
                 history["completed"].add(track_id)
                 history["pending"].pop(track_id, None)
